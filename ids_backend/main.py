@@ -259,7 +259,7 @@ async def alerts(
     return {"count": len(rows), "alerts": rows}
 
 
-@app.get("/logs", summary="Query traffic log history")
+@app.get("/logs", summary="Query traffic logs history")
 async def logs(
     limit: int = Query(default=100, ge=1, le=10000),
     from_time: Optional[str] = Query(default=None, description="ISO-8601 timestamp lower bound (inclusive)"),
@@ -294,6 +294,7 @@ async def capture_stop():
     stopped = capture.stop_capture()
     if stopped:
         return {"status": "stopped", "capturing": False}
+
     return {"status": "not_running", "capturing": False}
 
 
