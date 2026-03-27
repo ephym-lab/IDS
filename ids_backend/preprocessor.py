@@ -7,7 +7,7 @@ preprocess(record)  ->  np.ndarray of shape (1, 183), dtype float32
 """
 
 import os
-import pickle
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -15,17 +15,14 @@ import pandas as pd
 # Artefact paths
 # ---------------------------------------------------------------------------
 _BASE = os.path.join(os.path.dirname(__file__), "models_dir")
-_SCALER_PATH = os.path.join(_BASE, "scaler.pkl")
-_LE_PATH = os.path.join(_BASE, "label_encoder.pkl")
+_SCALER_PATH = os.path.join(_BASE, "scaler(1).pkl")
+_LE_PATH     = os.path.join(_BASE, "label_encoder(1).pkl")
 
 # ---------------------------------------------------------------------------
 # Load artefacts once at import time
 # ---------------------------------------------------------------------------
-with open(_SCALER_PATH, "rb") as f:
-    scaler = pickle.load(f)
-
-with open(_LE_PATH, "rb") as f:
-    label_encoder = pickle.load(f)
+scaler        = joblib.load(_SCALER_PATH)
+label_encoder = joblib.load(_LE_PATH)
 
 # ---------------------------------------------------------------------------
 # Feature specification
@@ -113,7 +110,6 @@ def preprocess(record: dict) -> np.ndarray:
     # 2. One-hot encode the categorical columns
     for cat_col in CATEGORICAL_COLS:
         cat_value = str(record.get(cat_col, "-")).lower()
-        # Temporary column for get_dummies
         df[cat_col] = cat_value
 
     df = pd.get_dummies(df, columns=CATEGORICAL_COLS)
