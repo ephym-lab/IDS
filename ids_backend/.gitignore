@@ -1,2 +1,3 @@
 ids.db
 ../tf-env/
+__pycache__/
