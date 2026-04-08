@@ -22,13 +22,16 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
+import auth
 import capture
 import database
+import email_service
 import model as mdl
 import preprocessor
 
@@ -51,6 +54,27 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down IDS backend.")
     capture.stop_capture()
+
+
+# ---------------------------------------------------------------------------
+# Security — bearer token extractor
+# ---------------------------------------------------------------------------
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)) -> dict:
+    """Dependency: validates JWT and returns the user dict."""
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+    try:
+        email = auth.decode_token(credentials.credentials)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    user = await database.get_user_by_email(email)
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found.")
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -146,10 +170,12 @@ def _build_predict_response(class_label: str, confidence: float) -> dict:
 # ---------------------------------------------------------------------------
 
 @app.post("/predict", response_model=PredictResponse, summary="Single record prediction")
-async def predict(req: PredictRequest):
+async def predict(req: PredictRequest, background_tasks: BackgroundTasks):
     """
     Accept a single JSON network record and return the prediction.
     Also persists the result to the logs (and alerts if applicable).
+    If the detected attack is High severity, an email notification is sent
+    in the background to all registered users.
     """
     try:
         record = req.model_dump()
@@ -163,6 +189,7 @@ async def predict(req: PredictRequest):
         raise HTTPException(status_code=500, detail=f"Model inference failed: {exc}") from exc
 
     is_attack = class_label != "Normal"
+    severity = database.get_severity(class_label) if is_attack else None
 
     await database.insert_log(
         src_ip=req.src_ip,
@@ -173,12 +200,26 @@ async def predict(req: PredictRequest):
         is_attack=is_attack,
     )
     if is_attack:
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
         await database.insert_alert(
             src_ip=req.src_ip,
             dst_ip=req.dst_ip,
             attack_type=class_label,
             confidence=confidence,
         )
+        if severity == "High":
+            recipients = await database.get_all_user_emails()
+            background_tasks.add_task(
+                email_service.notify_high_severity,
+                attack_type=class_label,
+                severity=severity,
+                src_ip=req.src_ip,
+                dst_ip=req.dst_ip,
+                confidence=confidence,
+                timestamp=ts,
+                recipients=recipients,
+            )
 
     return _build_predict_response(class_label, confidence)
 
@@ -202,6 +243,7 @@ async def upload(file: UploadFile = File(...)):
     attack_counts: dict[str, int] = {}
     total = 0
     errors = 0
+    high_notified = False  # send at most one email per batch upload
 
     for _, row in df.iterrows():
         total += 1
@@ -215,6 +257,7 @@ async def upload(file: UploadFile = File(...)):
             continue
 
         is_attack = class_label != "Normal"
+        row_severity = database.get_severity(class_label) if is_attack else None
         src_ip = str(record.get("src_ip", "0.0.0.0"))
         dst_ip = str(record.get("dst_ip", "0.0.0.0"))
         proto = str(record.get("proto", "-"))
@@ -228,6 +271,8 @@ async def upload(file: UploadFile = File(...)):
             is_attack=is_attack,
         )
         if is_attack:
+            from datetime import datetime, timezone
+            ts = datetime.now(timezone.utc).isoformat()
             attack_counts[class_label] = attack_counts.get(class_label, 0) + 1
             await database.insert_alert(
                 src_ip=src_ip,
@@ -235,6 +280,21 @@ async def upload(file: UploadFile = File(...)):
                 attack_type=class_label,
                 confidence=confidence,
             )
+            if row_severity == "High" and not high_notified:
+                recipients = await database.get_all_user_emails()
+                if recipients:
+                    asyncio.create_task(
+                        email_service.notify_high_severity(
+                            attack_type=class_label,
+                            severity=row_severity,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            confidence=confidence,
+                            timestamp=ts,
+                            recipients=recipients,
+                        )
+                    )
+                    high_notified = True  # send only one notification per batch
 
         results.append(_build_predict_response(class_label, confidence))
 
@@ -245,6 +305,81 @@ async def upload(file: UploadFile = File(...)):
         "attack_counts": attack_counts,
         "results": results,
     })
+
+
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/signup", status_code=201, summary="Register a new user")
+async def signup(req: auth.SignupRequest):
+    """
+    Create a new user account.
+    Requires: full_name, email, password (min 8 chars).
+    Returns the user profile and a JWT access token.
+    """
+    hashed = auth.hash_password(req.password)
+    try:
+        user = await database.create_user(
+            full_name=req.full_name,
+            email=req.email,
+            hashed_password=hashed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    token = auth.create_access_token(subject=user["email"])
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user["id"],
+            "full_name": user["full_name"],
+            "email": user["email"],
+            "created_at": user["created_at"],
+        },
+    }
+
+
+@app.post("/auth/login", summary="Authenticate and get a JWT token")
+async def login(req: auth.LoginRequest):
+    """
+    Authenticate with email and password.
+    Returns a JWT access token on success.
+    """
+    user = await database.get_user_by_email(req.email)
+    if user is None or not auth.verify_password(req.password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = auth.create_access_token(subject=user["email"])
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user["id"],
+            "full_name": user["full_name"],
+            "email": user["email"],
+            "created_at": user["created_at"],
+        },
+    }
+
+
+@app.get("/auth/me", summary="Get current authenticated user")
+async def me(current_user: dict = Depends(get_current_user)):
+    """
+    Returns the profile of the currently authenticated user.
+    Requires: Authorization: Bearer <token>
+    """
+    return {
+        "id": current_user["id"],
+        "full_name": current_user["full_name"],
+        "email": current_user["email"],
+        "created_at": current_user["created_at"],
+    }
 
 
 @app.get("/alerts", summary="Query alert history")

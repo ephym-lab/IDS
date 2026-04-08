@@ -4,6 +4,7 @@ annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0
 astunparse==1.6.3
+bcrypt
 certifi==2026.2.25
 charset-normalizer==3.4.6
 click==8.3.1
@@ -35,7 +36,9 @@ pydantic_core==2.41.5
 Pygments==2.19.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
+python-jose[cryptography]
 python-multipart==0.0.22
+passlib[bcrypt]
 pytz==2026.1.post1
 PyYAML==6.0.3
 requests==2.33.0

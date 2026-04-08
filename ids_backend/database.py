@@ -7,6 +7,7 @@ Tables
 ------
 logs   : every record processed (including normal traffic)
 alerts : attack detections only (excludes Normal)
+users  : registered users for auth and email notifications
 
 Severity rules
 --------------
@@ -59,6 +60,17 @@ async def init_db() -> None:
                 attack_type TEXT NOT NULL,
                 confidence  REAL NOT NULL,
                 severity    TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name       TEXT    NOT NULL,
+                email           TEXT    NOT NULL UNIQUE,
+                hashed_password TEXT    NOT NULL,
+                created_at      TEXT    NOT NULL
             )
             """
         )
@@ -192,3 +204,58 @@ async def get_stats() -> dict:
         "attacks_by_class": attacks_by_class,
         "alerts_today": alerts_today,
     }
+
+
+# ---------------------------------------------------------------------------
+# Users — Auth & Email Notifications
+# ---------------------------------------------------------------------------
+
+async def create_user(
+    *,
+    full_name: str,
+    email: str,
+    hashed_password: str,
+) -> dict:
+    """Insert a new user. Raises ValueError on duplicate email."""
+    ts = _now_iso()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                INSERT INTO users (full_name, email, hashed_password, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (full_name, email.lower(), hashed_password, ts),
+            )
+            await db.commit()
+            user_id = cursor.lastrowid
+            async with db.execute(
+                "SELECT id, full_name, email, created_at FROM users WHERE id = ?",
+                (user_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            return dict(row)
+    except aiosqlite.IntegrityError:
+        raise ValueError(f"A user with email '{email}' already exists.")
+
+
+async def get_user_by_email(email: str) -> Optional[dict]:
+    """Fetch a user record (including hashed_password) by email. Returns None if not found."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM users WHERE email = ?",
+            (email.lower(),),
+        ) as cursor:
+            row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def get_all_user_emails() -> list[str]:
+    """Return all registered user email addresses (for broadcast notifications)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT email FROM users") as cursor:
+            rows = await cursor.fetchall()
+    return [r["email"] for r in rows]
