@@ -7,11 +7,22 @@ Endpoints
 ---------
 POST /predict          — single JSON record prediction
 POST /upload           — CSV batch prediction
-GET  /alerts           — query alert history
-GET  /logs             — query full traffic log
-GET  /stats            — summary statistics
+GET  /alerts           — query alert history (scoped to authenticated user)
+GET  /logs             — query full traffic log (scoped to authenticated user)
+GET  /stats            — summary statistics (scoped to authenticated user)
 POST /capture/start    — start live packet capture
 POST /capture/stop     — stop live packet capture
+GET  /capture/status   — capture thread status
+POST /auth/signup      — register a new user
+POST /auth/login       — authenticate and get a JWT token
+GET  /auth/me          — get current authenticated user
+
+Email notification rules
+------------------------
+Emails are sent only to the logged-in user who triggered the prediction.
+An email is sent when:
+  - Severity is High   (any confidence)
+  - Severity is Medium AND confidence > 60%
 """
 
 import asyncio
@@ -41,6 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Lifespan — load all ML artefacts and initialise DB once at startup
 # ---------------------------------------------------------------------------
@@ -63,7 +75,9 @@ async def lifespan(app: FastAPI):
 _bearer = HTTPBearer(auto_error=False)
 
 
-async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)) -> dict:
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> dict:
     """Dependency: validates JWT and returns the user dict."""
     if credentials is None:
         raise HTTPException(status_code=401, detail="Not authenticated.")
@@ -95,6 +109,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas
@@ -151,7 +166,7 @@ class PredictResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _build_predict_response(class_label: str, confidence: float) -> dict:
@@ -165,17 +180,40 @@ def _build_predict_response(class_label: str, confidence: float) -> dict:
     }
 
 
+def _should_email(severity: str, confidence: float) -> bool:
+    """
+    Return True if this prediction warrants an email notification.
+
+    Rules:
+      - High severity   → always notify (regardless of confidence)
+      - Medium severity → notify only when confidence > 60%
+      - Low severity    → never notify
+    """
+    if severity == "High":
+        return True
+    if severity == "Medium" and confidence > 0.60:
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
-# Endpoints
+# Prediction endpoints
 # ---------------------------------------------------------------------------
 
 @app.post("/predict", response_model=PredictResponse, summary="Single record prediction")
-async def predict(req: PredictRequest, background_tasks: BackgroundTasks):
+async def predict(
+    req: PredictRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Accept a single JSON network record and return the prediction.
-    Also persists the result to the logs (and alerts if applicable).
-    If the detected attack is High severity, an email notification is sent
-    in the background to all registered users.
+    Persists the result to logs (and alerts if applicable), scoped to the
+    authenticated user.
+
+    Email notification is sent to the logged-in user when:
+      - Severity is High (any confidence), or
+      - Severity is Medium and confidence > 60%
     """
     try:
         record = req.model_dump()
@@ -190,6 +228,7 @@ async def predict(req: PredictRequest, background_tasks: BackgroundTasks):
 
     is_attack = class_label != "Normal"
     severity = database.get_severity(class_label) if is_attack else None
+    user_id = current_user["id"]
 
     await database.insert_log(
         src_ip=req.src_ip,
@@ -198,37 +237,48 @@ async def predict(req: PredictRequest, background_tasks: BackgroundTasks):
         predicted_class=class_label,
         confidence=confidence,
         is_attack=is_attack,
+        user_id=user_id,
     )
+
     if is_attack:
         from datetime import datetime, timezone
         ts = datetime.now(timezone.utc).isoformat()
+
         await database.insert_alert(
             src_ip=req.src_ip,
             dst_ip=req.dst_ip,
             attack_type=class_label,
             confidence=confidence,
+            user_id=user_id,
         )
-        if severity == "High":
-            recipients = await database.get_all_user_emails()
+
+        if severity and _should_email(severity, confidence):
             background_tasks.add_task(
-                email_service.notify_high_severity,
+                email_service.notify_alert,
                 attack_type=class_label,
                 severity=severity,
                 src_ip=req.src_ip,
                 dst_ip=req.dst_ip,
                 confidence=confidence,
                 timestamp=ts,
-                recipients=recipients,
+                recipients=[current_user["email"]],
             )
 
     return _build_predict_response(class_label, confidence)
 
 
 @app.post("/upload", summary="Batch CSV prediction")
-async def upload(file: UploadFile = File(...)):
+async def upload(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
     """
     Upload a CSV file with raw network features.
-    Runs batch prediction, stores all results, and returns a summary.
+    Runs batch prediction, stores all results scoped to the authenticated user,
+    and returns a summary.
+
+    At most one email notification is sent per batch upload (to avoid flooding
+    the user's inbox). The first row that meets the notification rules triggers it.
     """
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
@@ -239,11 +289,12 @@ async def upload(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {exc}") from exc
 
+    user_id = current_user["id"]
     results = []
     attack_counts: dict[str, int] = {}
     total = 0
     errors = 0
-    high_notified = False  # send at most one email per batch upload
+    email_sent = False  # send at most one email per batch upload
 
     for _, row in df.iterrows():
         total += 1
@@ -269,32 +320,35 @@ async def upload(file: UploadFile = File(...)):
             predicted_class=class_label,
             confidence=confidence,
             is_attack=is_attack,
+            user_id=user_id,
         )
+
         if is_attack:
             from datetime import datetime, timezone
             ts = datetime.now(timezone.utc).isoformat()
             attack_counts[class_label] = attack_counts.get(class_label, 0) + 1
+
             await database.insert_alert(
                 src_ip=src_ip,
                 dst_ip=dst_ip,
                 attack_type=class_label,
                 confidence=confidence,
+                user_id=user_id,
             )
-            if row_severity == "High" and not high_notified:
-                recipients = await database.get_all_user_emails()
-                if recipients:
-                    asyncio.create_task(
-                        email_service.notify_high_severity(
-                            attack_type=class_label,
-                            severity=row_severity,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            confidence=confidence,
-                            timestamp=ts,
-                            recipients=recipients,
-                        )
+
+            if row_severity and _should_email(row_severity, confidence) and not email_sent:
+                asyncio.create_task(
+                    email_service.notify_alert(
+                        attack_type=class_label,
+                        severity=row_severity,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        confidence=confidence,
+                        timestamp=ts,
+                        recipients=[current_user["email"]],
                     )
-                    high_notified = True  # send only one notification per batch
+                )
+                email_sent = True
 
         results.append(_build_predict_response(class_label, confidence))
 
@@ -382,15 +436,20 @@ async def me(current_user: dict = Depends(get_current_user)):
     }
 
 
+# ---------------------------------------------------------------------------
+# Data endpoints — all scoped to the authenticated user
+# ---------------------------------------------------------------------------
+
 @app.get("/alerts", summary="Query alert history")
 async def alerts(
     limit: int = Query(default=100, ge=1, le=10000),
     severity: Optional[str] = Query(default=None, description="Filter by severity: High, Medium, Low"),
+    current_user: dict = Depends(get_current_user),
 ):
-    """Return alerts from the database, newest first."""
+    """Return alerts for the authenticated user, newest first."""
     if severity and severity not in ("High", "Medium", "Low"):
         raise HTTPException(status_code=400, detail="severity must be 'High', 'Medium', or 'Low'.")
-    rows = await database.get_alerts(limit=limit, severity=severity)
+    rows = await database.get_alerts(limit=limit, severity=severity, user_id=current_user["id"])
     return {"count": len(rows), "alerts": rows}
 
 
@@ -398,17 +457,22 @@ async def alerts(
 async def logs(
     limit: int = Query(default=100, ge=1, le=10000),
     from_time: Optional[str] = Query(default=None, description="ISO-8601 timestamp lower bound (inclusive)"),
+    current_user: dict = Depends(get_current_user),
 ):
-    """Return log records from the database, newest first."""
-    rows = await database.get_logs(limit=limit, from_time=from_time)
+    """Return log records for the authenticated user, newest first."""
+    rows = await database.get_logs(limit=limit, from_time=from_time, user_id=current_user["id"])
     return {"count": len(rows), "logs": rows}
 
 
 @app.get("/stats", summary="Summary statistics")
-async def stats():
-    """Return summary counts: total traffic, attacks by class, alerts today."""
-    return await database.get_stats()
+async def stats(current_user: dict = Depends(get_current_user)):
+    """Return summary counts scoped to the authenticated user."""
+    return await database.get_stats(user_id=current_user["id"])
 
+
+# ---------------------------------------------------------------------------
+# Capture endpoints
+# ---------------------------------------------------------------------------
 
 @app.post("/capture/start", summary="Start live packet capture")
 async def capture_start():
@@ -429,7 +493,6 @@ async def capture_stop():
     stopped = capture.stop_capture()
     if stopped:
         return {"status": "stopped", "capturing": False}
-
     return {"status": "not_running", "capturing": False}
 
 
@@ -445,3 +508,5 @@ async def capture_status():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    

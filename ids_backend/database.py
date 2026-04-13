@@ -33,9 +33,17 @@ SEVERITY_MAP: dict[str, str] = {
 }
 
 
+async def _column_exists(db: aiosqlite.Connection, table: str, column: str) -> bool:
+    """Return True if *column* already exists in *table*."""
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    return any(row[1] == column for row in rows)
+
+
 async def init_db() -> None:
-    """Create tables if they do not exist."""
+    """Create tables if they do not exist and run idempotent migrations."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # --- logs ---
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS logs (
@@ -46,10 +54,18 @@ async def init_db() -> None:
                 proto           TEXT,
                 predicted_class TEXT    NOT NULL,
                 confidence      REAL    NOT NULL,
-                is_attack       INTEGER NOT NULL
+                is_attack       INTEGER NOT NULL,
+                user_id         INTEGER REFERENCES users(id)
             )
             """
         )
+        # Migration: safely add user_id to existing DB (no-op if already present)
+        if not await _column_exists(db, "logs", "user_id"):
+            await db.execute(
+                "ALTER TABLE logs ADD COLUMN user_id INTEGER REFERENCES users(id)"
+            )
+
+        # --- alerts ---
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS alerts (
@@ -59,10 +75,17 @@ async def init_db() -> None:
                 dst_ip      TEXT,
                 attack_type TEXT NOT NULL,
                 confidence  REAL NOT NULL,
-                severity    TEXT NOT NULL
+                severity    TEXT NOT NULL,
+                user_id     INTEGER REFERENCES users(id)
             )
             """
         )
+        if not await _column_exists(db, "alerts", "user_id"):
+            await db.execute(
+                "ALTER TABLE alerts ADD COLUMN user_id INTEGER REFERENCES users(id)"
+            )
+
+        # --- users ---
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -93,17 +116,19 @@ async def insert_log(
     predicted_class: str,
     confidence: float,
     is_attack: bool,
+    user_id: Optional[int] = None,
     timestamp: Optional[str] = None,
 ) -> int:
-    """Insert a single log record. Returns the new row id."""
+    """Insert a single log record tagged with *user_id*. Returns the new row id."""
     ts = timestamp or _now_iso()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            INSERT INTO logs (timestamp, src_ip, dst_ip, proto, predicted_class, confidence, is_attack)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO logs
+                (timestamp, src_ip, dst_ip, proto, predicted_class, confidence, is_attack, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (ts, src_ip, dst_ip, proto, predicted_class, float(confidence), int(is_attack)),
+            (ts, src_ip, dst_ip, proto, predicted_class, float(confidence), int(is_attack), user_id),
         )
         await db.commit()
         return cursor.lastrowid
@@ -115,18 +140,19 @@ async def insert_alert(
     dst_ip: str,
     attack_type: str,
     confidence: float,
+    user_id: Optional[int] = None,
     timestamp: Optional[str] = None,
 ) -> int:
-    """Insert an alert record. Returns the new row id."""
+    """Insert an alert record tagged with *user_id*. Returns the new row id."""
     ts = timestamp or _now_iso()
     severity = get_severity(attack_type)
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            INSERT INTO alerts (timestamp, src_ip, dst_ip, attack_type, confidence, severity)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO alerts (timestamp, src_ip, dst_ip, attack_type, confidence, severity, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (ts, src_ip, dst_ip, attack_type, float(confidence), severity),
+            (ts, src_ip, dst_ip, attack_type, float(confidence), severity, user_id),
         )
         await db.commit()
         return cursor.lastrowid
@@ -135,13 +161,25 @@ async def insert_alert(
 async def get_logs(
     limit: int = 100,
     from_time: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> list[dict]:
-    """Retrieve log records, newest first."""
-    query = "SELECT * FROM logs"
+    """Retrieve log records for *user_id*, newest first.
+
+    When *user_id* is None all records are returned (admin use).
+    """
+    conditions: list[str] = []
     params: list = []
+
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(user_id)
     if from_time:
-        query += " WHERE timestamp >= ?"
+        conditions.append("timestamp >= ?")
         params.append(from_time)
+
+    query = "SELECT * FROM logs"
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
 
@@ -155,13 +193,25 @@ async def get_logs(
 async def get_alerts(
     limit: int = 100,
     severity: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> list[dict]:
-    """Retrieve alert records, newest first."""
-    query = "SELECT * FROM alerts"
+    """Retrieve alert records for *user_id*, newest first.
+
+    When *user_id* is None all records are returned (admin use).
+    """
+    conditions: list[str] = []
     params: list = []
+
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(user_id)
     if severity:
-        query += " WHERE severity = ?"
+        conditions.append("severity = ?")
         params.append(severity)
+
+    query = "SELECT * FROM alerts"
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
 
@@ -172,30 +222,54 @@ async def get_alerts(
     return [dict(r) for r in rows]
 
 
-async def get_stats() -> dict:
-    """Return summary statistics."""
+async def get_stats(user_id: Optional[int] = None) -> dict:
+    """Return summary statistics scoped to *user_id*.
+
+    When *user_id* is None global stats are returned (admin use).
+    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    user_filter = "user_id = ?" if user_id is not None else ""
+    user_params: list = [user_id] if user_id is not None else []
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
-        # Total traffic
-        async with db.execute("SELECT COUNT(*) AS total FROM logs") as cur:
+        # Total traffic for this user
+        q_total = "SELECT COUNT(*) AS total FROM logs"
+        if user_filter:
+            q_total += f" WHERE {user_filter}"
+        async with db.execute(q_total, user_params) as cur:
             total_row = await cur.fetchone()
         total_traffic = total_row["total"] if total_row else 0
 
-        # Attacks breakdown by class
-        async with db.execute(
-            "SELECT predicted_class, COUNT(*) AS cnt FROM logs WHERE is_attack = 1 GROUP BY predicted_class"
-        ) as cur:
+        # Attacks breakdown by class for this user
+        if user_filter:
+            q_attacks = (
+                "SELECT predicted_class, COUNT(*) AS cnt FROM logs "
+                f"WHERE is_attack = 1 AND {user_filter} GROUP BY predicted_class"
+            )
+            attacks_params = [user_id]
+        else:
+            q_attacks = (
+                "SELECT predicted_class, COUNT(*) AS cnt FROM logs "
+                "WHERE is_attack = 1 GROUP BY predicted_class"
+            )
+            attacks_params = []
+        async with db.execute(q_attacks, attacks_params) as cur:
             attack_rows = await cur.fetchall()
         attacks_by_class = {r["predicted_class"]: r["cnt"] for r in attack_rows}
 
-        # Alerts today
-        async with db.execute(
-            "SELECT COUNT(*) AS cnt FROM alerts WHERE timestamp LIKE ?",
-            (f"{today}%",),
-        ) as cur:
+        # Alerts today for this user
+        if user_filter:
+            q_today = (
+                "SELECT COUNT(*) AS cnt FROM alerts "
+                f"WHERE timestamp LIKE ? AND {user_filter}"
+            )
+            today_params: list = [f"{today}%", user_id]
+        else:
+            q_today = "SELECT COUNT(*) AS cnt FROM alerts WHERE timestamp LIKE ?"
+            today_params = [f"{today}%"]
+        async with db.execute(q_today, today_params) as cur:
             today_row = await cur.fetchone()
         alerts_today = today_row["cnt"] if today_row else 0
 

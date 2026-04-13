@@ -261,7 +261,7 @@ def _send_smtp(recipients: list[str], subject: str, html_body: str) -> None:
         logger.error("Failed to send alert email: %s", exc)
 
 
-async def notify_high_severity(
+async def notify_alert(
     *,
     attack_type: str,
     severity: str,
@@ -269,14 +269,9 @@ async def notify_high_severity(
     dst_ip: str,
     confidence: float,
     timestamp: str,
-    recipients: list[str],
+    recipients: list[str],   # pass [current_user_email] for single, all emails for broadcast
 ) -> None:
-    """
-    Send a High-severity alert email to all *recipients* asynchronously.
-
-    This function is async-safe: the blocking SMTP call is dispatched to a
-    thread-pool executor so it never blocks the FastAPI event loop.
-    """
+    """Send an alert email. Caller decides who receives it."""
     if not recipients:
         return
 
