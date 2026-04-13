@@ -194,3 +194,114 @@ Stops the live packet sniffing thread.
 Checks if the live capture thread is currently running.
 
 *   **Response**: `{"capturing": true}`
+
+---
+
+## 4. Authentication Endpoints
+
+### `POST /auth/signup`
+Register a new user account.
+
+*   **Description**: Creates a new user with a bcrypt-hashed password and returns a JWT access token immediately. No email verification required. Password must be at least 8 characters.
+*   **Request Body**: `application/json`
+    ```json
+    {
+      "full_name": "Jane Doe",
+      "email": "jane@example.com",
+      "password": "s3cur3P@ss"
+    }
+    ```
+*   **Response Body** (`201 Created`):
+    ```json
+    {
+      "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+      "token_type": "bearer",
+      "user": {
+        "id": 1,
+        "full_name": "Jane Doe",
+        "email": "jane@example.com",
+        "created_at": "2026-04-08T10:00:00+00:00"
+      }
+    }
+    ```
+*   **Error Responses**:
+    *   `409 Conflict` — email already registered
+    *   `422 Unprocessable Entity` — validation failure (short password, invalid email)
+*   **Example Usage**:
+    ```bash
+    curl -X POST http://localhost:8000/auth/signup \
+      -H "Content-Type: application/json" \
+      -d '{"full_name": "Jane Doe", "email": "jane@example.com", "password": "s3cur3P@ss"}'
+    ```
+
+---
+
+### `POST /auth/login`
+Authenticate with email and password.
+
+*   **Description**: Verifies credentials against the database. On success, returns a signed JWT token valid for 60 minutes (or the value of `ACCESS_TOKEN_EXPIRE_MINUTES` in `.env`).
+*   **Request Body**: `application/json`
+    ```json
+    {
+      "email": "jane@example.com",
+      "password": "s3cur3P@ss"
+    }
+    ```
+*   **Response Body** (`200 OK`):
+    ```json
+    {
+      "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+      "token_type": "bearer",
+      "user": {
+        "id": 1,
+        "full_name": "Jane Doe",
+        "email": "jane@example.com",
+        "created_at": "2026-04-08T10:00:00+00:00"
+      }
+    }
+    ```
+*   **Error Responses**:
+    *   `401 Unauthorized` — wrong email or password
+*   **Example Usage**:
+    ```bash
+    curl -X POST http://localhost:8000/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"email": "jane@example.com", "password": "s3cur3P@ss"}'
+    ```
+
+---
+
+### `GET /auth/me`
+Get the currently authenticated user's profile.
+
+*   **Description**: Decodes the bearer token and returns the user's stored profile. Use this to verify a session is still valid or to display user info in the frontend.
+*   **Headers**: `Authorization: Bearer <access_token>`
+*   **Response Body** (`200 OK`):
+    ```json
+    {
+      "id": 1,
+      "full_name": "Jane Doe",
+      "email": "jane@example.com",
+      "created_at": "2026-04-08T10:00:00+00:00"
+    }
+    ```
+*   **Error Responses**:
+    *   `401 Unauthorized` — missing, expired, or invalid token
+*   **Example Usage**:
+    ```bash
+    curl http://localhost:8000/auth/me \
+      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    ```
+
+---
+
+## 5. Email Notification Behaviour
+
+Email alerts are triggered **automatically** — no dedicated endpoint is needed. The flow is:
+
+1. A prediction is made (via `/predict` or `/upload`)
+2. If the class is `DoS` or `Exploits` (severity = **High**)
+3. All registered user emails are fetched from the database
+4. A richly-formatted HTML alert email is dispatched **in the background** (non-blocking)
+
+Configure SMTP credentials in `ids_backend/.env` before expecting emails to arrive. See the [README](../README.md#email-notifications) for setup instructions.

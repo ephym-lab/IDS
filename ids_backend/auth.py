@@ -5,19 +5,23 @@ Authentication helpers for the IDS backend.
 
 Responsibilities
 ----------------
-- Password hashing & verification  (passlib / bcrypt)
+- Password hashing & verification  (bcrypt — used directly, not via passlib)
 - JWT access token generation       (python-jose)
 - JWT token verification & decoding
 - Pydantic request/response schemas for auth endpoints
+
+Note: passlib is intentionally NOT used here because passlib's bcrypt backend
+breaks on bcrypt >= 4.0 (the `__about__` attribute was removed in that release).
+Calling bcrypt directly keeps things simple and compatible.
 """
 
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import bcrypt
 from dotenv import load_dotenv
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 
 load_dotenv()
@@ -31,20 +35,18 @@ ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
 # ---------------------------------------------------------------------------
-# Password hashing
+# Password hashing  (direct bcrypt — no passlib wrapper)
 # ---------------------------------------------------------------------------
 
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-
 def hash_password(plain: str) -> str:
-    """Return the bcrypt hash of *plain*."""
-    return _pwd_context.hash(plain)
+    """Return the bcrypt hash of *plain* as a UTF-8 string."""
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(plain.encode("utf-8"), salt).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """Return True if *plain* matches *hashed*."""
-    return _pwd_context.verify(plain, hashed)
+    """Return True if *plain* matches the stored *hashed* value."""
+    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
