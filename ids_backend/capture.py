@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 _stop_event = threading.Event()
 _capture_thread: threading.Thread | None = None
 
+# user_id of whoever called start_capture(); used to tag every DB row
+_session_user_id: int | None = None
+
 # Track per-flow stats for derived features (simplified)
 _flow_table: dict[tuple, dict] = {}
 _flow_lock = threading.Lock()
@@ -161,10 +164,11 @@ def _extract_features(pkt) -> dict | None:
         return None
 
 
-def _run_capture(loop: asyncio.AbstractEventLoop) -> None:
+def _run_capture(loop: asyncio.AbstractEventLoop, user_id: int | None) -> None:
     """
     Blocking Scapy sniff loop. Runs in the background daemon thread.
     For each packet: extract features -> preprocess -> predict -> DB insert.
+    All rows are tagged with *user_id* so they appear on the correct dashboard.
     """
     from scapy.sendrecv import sniff
     import database
@@ -190,6 +194,7 @@ def _run_capture(loop: asyncio.AbstractEventLoop) -> None:
                     predicted_class=class_label,
                     confidence=confidence,
                     is_attack=is_attack,
+                    user_id=user_id,
                 ),
                 loop,
             )
@@ -200,6 +205,7 @@ def _run_capture(loop: asyncio.AbstractEventLoop) -> None:
                         dst_ip=features["dst_ip"],
                         attack_type=class_label,
                         confidence=confidence,
+                        user_id=user_id,
                     ),
                     loop,
                 )
@@ -215,7 +221,7 @@ def _run_capture(loop: asyncio.AbstractEventLoop) -> None:
     logger.info("Packet capture stopped.")
 
 
-def start_capture(loop: asyncio.AbstractEventLoop) -> bool:
+def start_capture(loop: asyncio.AbstractEventLoop, user_id: int | None = None) -> bool:
     """
     Start the background capture thread (idempotent).
 
@@ -223,20 +229,24 @@ def start_capture(loop: asyncio.AbstractEventLoop) -> bool:
     ----------
     loop : asyncio.AbstractEventLoop
         The running FastAPI event loop, used for scheduling async DB writes.
+    user_id : int | None
+        The authenticated user who started this capture session.
+        Every log/alert row inserted during this session will carry this id.
 
     Returns
     -------
     bool  True if newly started, False if already running.
     """
-    global _capture_thread, _stop_event
+    global _capture_thread, _stop_event, _session_user_id
 
     if _capture_thread is not None and _capture_thread.is_alive():
         return False  # already running
 
+    _session_user_id = user_id
     _stop_event.clear()
     _capture_thread = threading.Thread(
         target=_run_capture,
-        args=(loop,),
+        args=(loop, user_id),
         daemon=True,
         name="ids-capture",
     )
@@ -252,7 +262,7 @@ def stop_capture() -> bool:
     -------
     bool  True if it was running, False if it was already stopped.
     """
-    global _capture_thread
+    global _capture_thread, _session_user_id
 
     if _capture_thread is None or not _capture_thread.is_alive():
         return False
@@ -260,6 +270,7 @@ def stop_capture() -> bool:
     _stop_event.set()
     _capture_thread.join(timeout=5)
     _capture_thread = None
+    _session_user_id = None
     return True
 
 
