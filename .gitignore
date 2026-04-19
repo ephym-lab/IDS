@@ -1,1 +1,4 @@
 tf-env/
+ids_backend/__pycache__/*
+ids_backend/*.pyc
+ids_backend/*.log

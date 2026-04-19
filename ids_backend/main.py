@@ -29,6 +29,7 @@ import asyncio
 import io
 import logging
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 import numpy as np
@@ -46,9 +47,22 @@ import email_service
 import model as mdl
 import preprocessor
 
+
+# ---------------------------------------------------------------------------
+# Logging — console + rotating file
+# ---------------------------------------------------------------------------
+
+_file_handler = RotatingFileHandler(
+    "ids.log", maxBytes=5_000_000, backupCount=3
+)
+_file_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[_file_handler, logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -471,11 +485,11 @@ async def stats(current_user: dict = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# Capture endpoints
+# Capture endpoints — all require authentication
 # ---------------------------------------------------------------------------
 
 @app.post("/capture/start", summary="Start live packet capture")
-async def capture_start():
+async def capture_start(current_user: dict = Depends(get_current_user)):
     """
     Start the background Scapy packet capture thread.
     Requires root/CAP_NET_RAW privileges to capture packets.
@@ -483,21 +497,23 @@ async def capture_start():
     loop = asyncio.get_event_loop()
     started = capture.start_capture(loop=loop)
     if started:
+        logger.info("Capture started by user: %s", current_user["email"])
         return {"status": "started", "capturing": True}
     return {"status": "already_running", "capturing": True}
 
 
 @app.post("/capture/stop", summary="Stop live packet capture")
-async def capture_stop():
+async def capture_stop(current_user: dict = Depends(get_current_user)):
     """Stop the background Scapy packet capture thread."""
     stopped = capture.stop_capture()
     if stopped:
+        logger.info("Capture stopped by user: %s", current_user["email"])
         return {"status": "stopped", "capturing": False}
     return {"status": "not_running", "capturing": False}
 
 
 @app.get("/capture/status", summary="Capture thread status")
-async def capture_status():
+async def capture_status(current_user: dict = Depends(get_current_user)):
     """Returns whether the live capture thread is currently running."""
     return {"capturing": capture.is_capturing()}
 
@@ -508,5 +524,3 @@ async def capture_status():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-    

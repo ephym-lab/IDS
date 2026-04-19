@@ -8,6 +8,12 @@ Each captured packet is:
   2. Preprocessed + run through the model
   3. Stored in the DB (log + optional alert)
 
+Email notification rules (mirrors main.py — no circular import)
+---------------------------------------------------------------
+  - High severity   → always notify all registered users
+  - Medium severity → notify only when confidence > 60%
+  - Low severity    → never notify
+
 Usage
 -----
     from capture import start_capture, stop_capture
@@ -21,8 +27,17 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+
+import email_service
 
 logger = logging.getLogger(__name__)
+
+# Scapy emits a noisy "Unable to guess type" WARNING for non-IP frames
+# (ARP, 802.11 management frames, etc.) seen on Wi-Fi interfaces.
+# These packets are already filtered out by the `if not pkt.haslayer(IP)`
+# guard in _extract_features(), so the warning is benign.
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
 _stop_event = threading.Event()
 _capture_thread: threading.Thread | None = None
@@ -31,6 +46,51 @@ _capture_thread: threading.Thread | None = None
 _flow_table: dict[tuple, dict] = {}
 _flow_lock = threading.Lock()
 
+
+# ---------------------------------------------------------------------------
+# Rotating file handler for capture logs
+# ---------------------------------------------------------------------------
+
+def _setup_capture_logger() -> None:
+    """
+    Attach a rotating file handler to the capture logger so packet-level
+    logs are written to ids_capture.log without flooding the console.
+    Keeps up to 3 files of 5 MB each.
+    """
+    if any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+        return  # already set up
+    handler = RotatingFileHandler(
+        "ids_capture.log", maxBytes=5_000_000, backupCount=3
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    logger.addHandler(handler)
+
+
+# ---------------------------------------------------------------------------
+# Email helper — local copy to avoid circular import with main.py
+# ---------------------------------------------------------------------------
+
+def _should_email(severity: str, confidence: float) -> bool:
+    """
+    Return True if this detection warrants an email notification.
+
+    Rules:
+      - High severity   → always notify (regardless of confidence)
+      - Medium severity → notify only when confidence > 60%
+      - Low severity    → never notify
+    """
+    if severity == "High":
+        return True
+    if severity == "Medium" and confidence > 0.60:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Feature extraction
+# ---------------------------------------------------------------------------
 
 def _extract_features(pkt) -> dict | None:
     """
@@ -64,11 +124,11 @@ def _extract_features(pkt) -> dict | None:
             tcp = pkt[TCP]
             sport, dport = tcp.sport, tcp.dport
             flags = tcp.flags
-            if flags & 0x01:   # FIN
+            if flags & 0x01:    # FIN
                 state = "FIN"
-            elif flags & 0x04: # RST
+            elif flags & 0x04:  # RST
                 state = "RST"
-            elif flags & 0x02: # SYN
+            elif flags & 0x02:  # SYN
                 state = "CON"
             # Rough service detection
             for port in (sport, dport):
@@ -85,7 +145,7 @@ def _extract_features(pkt) -> dict | None:
             udp = pkt[UDP]
             sport, dport = udp.sport, udp.dport
             state = "CON"
-            if sport == 53 or dport == 53: service = "dns"
+            if sport == 53 or dport == 53:   service = "dns"
             elif sport == 67 or dport == 67: service = "dhcp"
 
         elif pkt.haslayer(ICMP):
@@ -153,6 +213,9 @@ def _extract_features(pkt) -> dict | None:
             # Metadata (not used for inference)
             "src_ip": src_ip,
             "dst_ip": dst_ip,
+            # Ports stored for logging
+            "sport": sport,
+            "dport": dport,
         }
         return features
 
@@ -160,6 +223,10 @@ def _extract_features(pkt) -> dict | None:
         logger.debug("Feature extraction error: %s", exc)
         return None
 
+
+# ---------------------------------------------------------------------------
+# Capture loop
+# ---------------------------------------------------------------------------
 
 def _run_capture(loop: asyncio.AbstractEventLoop) -> None:
     """
@@ -172,16 +239,39 @@ def _run_capture(loop: asyncio.AbstractEventLoop) -> None:
     import preprocessor
 
     def _handle_packet(pkt) -> None:
+        print(f"RAW PACKET: {pkt.summary()}")
         features = _extract_features(pkt)
         if features is None:
             return
 
+        logger.info(
+            "Packet captured: %s -> %s | proto=%s sport=%s dport=%s bytes=%s",
+            features["src_ip"], features["dst_ip"],
+            features["proto"], features["sport"],
+            features["dport"], features["sbytes"],
+        )
+
         try:
             arr = preprocessor.preprocess(features)
+            logger.debug("Preprocessed features array: %s", arr)
+
             class_label, confidence = mdl.predict(arr)
             is_attack = class_label != "Normal"
+            severity = database.get_severity(class_label) if is_attack else None
 
-            # Schedule async DB writes on the FastAPI event loop
+            logger.info(
+                "Prediction: %s -> %s | class=%s confidence=%.4f is_attack=%s",
+                features["src_ip"], features["dst_ip"],
+                class_label, confidence, is_attack,
+            )
+
+            if is_attack:
+                logger.warning(
+                    "ATTACK DETECTED: %s -> %s | type=%s severity=%s confidence=%.4f",
+                    features["src_ip"], features["dst_ip"],
+                    class_label, severity, confidence,
+                )
+
             asyncio.run_coroutine_threadsafe(
                 database.insert_log(
                     src_ip=features["src_ip"],
@@ -193,6 +283,7 @@ def _run_capture(loop: asyncio.AbstractEventLoop) -> None:
                 ),
                 loop,
             )
+
             if is_attack:
                 asyncio.run_coroutine_threadsafe(
                     database.insert_alert(
@@ -203,6 +294,29 @@ def _run_capture(loop: asyncio.AbstractEventLoop) -> None:
                     ),
                     loop,
                 )
+
+                if severity and _should_email(severity, confidence):
+                    ts = datetime.now(timezone.utc).isoformat()
+
+                    async def _notify():
+                        recipients = await database.get_all_user_emails()
+                        if recipients:
+                            await email_service.notify_alert(
+                                attack_type=class_label,
+                                severity=severity,
+                                src_ip=features["src_ip"],
+                                dst_ip=features["dst_ip"],
+                                confidence=confidence,
+                                timestamp=ts,
+                                recipients=recipients,
+                            )
+
+                    asyncio.run_coroutine_threadsafe(_notify(), loop)
+                    logger.info(
+                        "Email notification queued for attack: type=%s severity=%s",
+                        class_label, severity,
+                    )
+
         except Exception as exc:  # noqa: BLE001
             logger.error("Prediction pipeline error: %s", exc)
 
@@ -214,6 +328,10 @@ def _run_capture(loop: asyncio.AbstractEventLoop) -> None:
     )
     logger.info("Packet capture stopped.")
 
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def start_capture(loop: asyncio.AbstractEventLoop) -> bool:
     """
@@ -233,6 +351,7 @@ def start_capture(loop: asyncio.AbstractEventLoop) -> bool:
     if _capture_thread is not None and _capture_thread.is_alive():
         return False  # already running
 
+    _setup_capture_logger()
     _stop_event.clear()
     _capture_thread = threading.Thread(
         target=_run_capture,
