@@ -287,3 +287,96 @@ async def notify_alert(
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _send_smtp, recipients, subject, html_body)
+
+
+# ---------------------------------------------------------------------------
+# OTP email
+# ---------------------------------------------------------------------------
+
+def _build_otp_html(otp: str, purpose: str, expire_minutes: int) -> str:
+    """Build a styled HTML email body for OTP delivery."""
+    action = "create your account" if purpose == "signup" else "log in to your account"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Your IDS Verification Code</title>
+</head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="560" cellpadding="0" cellspacing="0"
+               style="background:#1e293b;border-radius:12px;overflow:hidden;
+                      box-shadow:0 4px 32px rgba(0,0,0,0.5);">
+
+          <!-- Header -->
+          <tr>
+            <td style="background:linear-gradient(135deg,#1e3a5f,#0f172a);
+                        padding:28px 40px;border-bottom:2px solid #3b82f6;">
+              <span style="font-size:20px;font-weight:700;color:#f8fafc;
+                           letter-spacing:1px;">🛡️ Network IDS</span>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding:36px 40px;">
+              <p style="margin:0 0 8px;font-size:22px;font-weight:700;color:#f8fafc;">
+                Verification Code
+              </p>
+              <p style="margin:0 0 28px;font-size:14px;color:#94a3b8;line-height:1.6;">
+                Use the code below to {action}. It expires in {expire_minutes} minutes.
+              </p>
+
+              <!-- OTP box -->
+              <table width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td align="center">
+                    <div style="display:inline-block;background:#0f172a;border:2px solid #3b82f6;
+                                border-radius:12px;padding:20px 40px;margin:0 auto;">
+                      <span style="font-size:42px;font-weight:800;letter-spacing:12px;
+                                   color:#3b82f6;font-family:monospace;">{otp}</span>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+
+              <p style="margin:28px 0 0;font-size:13px;color:#64748b;line-height:1.6;">
+                If you didn't request this, you can safely ignore this email. Do not share this
+                code with anyone.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background:#0f172a;padding:18px 40px;border-top:1px solid #1e293b;">
+              <p style="margin:0;font-size:12px;color:#475569;text-align:center;">
+                This is an automated message from your Network Intrusion Detection System.<br/>
+                Do not reply to this email.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
+async def send_otp_email(
+    *,
+    email: str,
+    otp: str,
+    purpose: str = "login",   # "signup" | "login"
+    expire_minutes: int = 10,
+) -> None:
+    """Send the OTP verification code to *email*."""
+    subject = "🔐 Your IDS Verification Code"
+    html_body = _build_otp_html(otp=otp, purpose=purpose, expire_minutes=expire_minutes)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _send_smtp, [email], subject, html_body)

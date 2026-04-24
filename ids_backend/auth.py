@@ -6,6 +6,7 @@ Authentication helpers for the IDS backend.
 Responsibilities
 ----------------
 - Password hashing & verification  (bcrypt — used directly, not via passlib)
+- OTP generation, hashing & verification
 - JWT access token generation       (python-jose)
 - JWT token verification & decoding
 - Pydantic request/response schemas for auth endpoints
@@ -16,6 +17,7 @@ Calling bcrypt directly keeps things simple and compatible.
 """
 
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -47,6 +49,34 @@ def hash_password(plain: str) -> str:
 def verify_password(plain: str, hashed: str) -> bool:
     """Return True if *plain* matches the stored *hashed* value."""
     return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# OTP helpers
+# ---------------------------------------------------------------------------
+
+OTP_EXPIRE_MINUTES: int = int(os.getenv("OTP_EXPIRE_MINUTES", "10"))
+
+
+def generate_otp() -> str:
+    """Return a cryptographically-random 6-digit OTP string (zero-padded)."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def hash_otp(plain_otp: str) -> str:
+    """Return the bcrypt hash of *plain_otp* as a UTF-8 string."""
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(plain_otp.encode("utf-8"), salt).decode("utf-8")
+
+
+def verify_otp(plain_otp: str, hashed_otp: str) -> bool:
+    """Return True if *plain_otp* matches the stored *hashed_otp*."""
+    return bcrypt.checkpw(plain_otp.encode("utf-8"), hashed_otp.encode("utf-8"))
+
+
+def otp_expiry_iso() -> str:
+    """Return an ISO-8601 timestamp *OTP_EXPIRE_MINUTES* from now (UTC)."""
+    return (datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES)).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +137,15 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr = Field(..., examples=["jane@example.com"])
     password: str = Field(..., examples=["s3cur3P@ss"])
+
+
+class OtpVerifyRequest(BaseModel):
+    email: EmailStr = Field(..., examples=["jane@example.com"])
+    otp: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$", examples=["123456"])
+
+
+class ResendOtpRequest(BaseModel):
+    email: EmailStr = Field(..., examples=["jane@example.com"])
 
 
 class TokenResponse(BaseModel):
